@@ -694,6 +694,16 @@
 
 
 
+<div class="viewcode-block" id="image_to_bytes">
+<a class="viewcode-back" href="../../../api/data_juicer.utils.mm_utils.html#data_juicer.utils.mm_utils.image_to_bytes">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">image_to_bytes</span><span class="p">(</span><span class="n">image</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Encode a PIL image as PNG file bytes, which ``load_image`` can read back."""</span>
+    <span class="n">buffer</span> <span class="o">=</span> <span class="n">io</span><span class="o">.</span><span class="n">BytesIO</span><span class="p">()</span>
+    <span class="n">image</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span> <span class="nb">format</span><span class="o">=</span><span class="s2">"PNG"</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">buffer</span><span class="o">.</span><span class="n">getvalue</span><span class="p">()</span></div>
+
+
+
 <div class="viewcode-block" id="image_path_to_base64">
 <a class="viewcode-back" href="../../../api/data_juicer.utils.mm_utils.html#data_juicer.utils.mm_utils.image_path_to_base64">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">image_path_to_base64</span><span class="p">(</span><span class="n">image_path</span><span class="p">):</span>
