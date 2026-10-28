@@ -4,7 +4,6 @@
 
 import hashlib
 import struct
-from collections import defaultdict
 from typing import Optional
 
 import numpy as np
@@ -202,7 +201,7 @@ class DocumentMinhashDeduplicator(Deduplicator):
         self.hash_ranges = [
             (i * self.num_rows_per_band, (i + 1) * self.num_rows_per_band) for i in range(self.num_bands)
         ]
-        self.hash_tables = [defaultdict(set) for _ in range(self.num_bands)]
+        self._reset_hash_tables()
 
         # generate permutations
         gen = np.random.RandomState(seed=42)
@@ -282,7 +281,9 @@ class DocumentMinhashDeduplicator(Deduplicator):
         return sample
 
     def _reset_hash_tables(self):
-        self.hash_tables = [defaultdict(set) for _ in range(self.num_bands)]
+        # each table maps a band hash to the first sample that has it; a
+        # set per hash would be allocated for every sample in every band
+        self.hash_tables = [{} for _ in range(self.num_bands)]
 
     def process(self, dataset, show_num=0):
         """
@@ -304,26 +305,21 @@ class DocumentMinhashDeduplicator(Deduplicator):
         # when exporting the processed dataset
         dataset = dataset.remove_columns([HashKeys.minhash])
 
-        # make clusters -- construct the minhash lookup tables of seg to ids
+        # make clusters -- union each sample with the first sample that
+        # shares one of its band hashes. Roots are the smallest index of
+        # each cluster, as UnionFind.union always keeps the minimum.
         logger.info(f"Start clustering for {len(dataset)} samples...")
+        union_find = UnionFind()
         batch_size = 10000
         for i in tqdm(
             range(0, len(minhashes), batch_size), dynamic_ncols=True, desc="Iterating MinHashes of samples..."
         ):
             batch = minhashes[i : i + batch_size]
-            for idx, hs in enumerate(batch):
+            for idx, hs in enumerate(batch, start=i):
                 for h, hashtable in zip(hs, self.hash_tables):
-                    hashtable[h].add(idx + i)
-
-        # using UnionFind set to union samples within the same clusters
-        union_find = UnionFind()
-        for table in tqdm(self.hash_tables, dynamic_ncols=True, desc="Clustering"):
-            for cluster in table.values():
-                if len(cluster) <= 1:
-                    continue
-                idx = min(cluster)
-                for x in cluster:
-                    union_find.union(x, idx)
+                    first = hashtable.setdefault(h, idx)
+                    if first != idx:
+                        union_find.union(idx, first)
         logger.info(
             f"There are {len(set(union_find.parent.values()))} "
             f"clusters that includes multiple near-duplicate samples."
@@ -398,8 +394,11 @@ class DocumentMinhashDeduplicatorWithUid(DocumentMinhashDeduplicator):
         uids = dataset[HashKeys.uid]
         uid2idx = {uid: idx for idx, uid in enumerate(uids)}
 
-        # make clusters -- construct the minhash lookup tables of seg to ids
+        # make clusters -- union each sample with the first sample that
+        # shares one of its band hashes. Roots are the smallest uid of each
+        # cluster, as UnionFind.union always keeps the minimum.
         logger.info(f"Start clustering for {len(dataset)} samples...")
+        union_find = UnionFind()
         batch_size = 10000
         for i in tqdm(
             range(0, len(minhashes), batch_size), dynamic_ncols=True, desc="Iterating MinHashes of samples..."
@@ -408,17 +407,9 @@ class DocumentMinhashDeduplicatorWithUid(DocumentMinhashDeduplicator):
             batch_uid = uids[i : i + batch_size]
             for uid, hs in zip(batch_uid, batch):
                 for h, hashtable in zip(hs, self.hash_tables):
-                    hashtable[h].add(uid)
-
-        # using UnionFind set to union samples within the same clusters
-        union_find = UnionFind()
-        for table in tqdm(self.hash_tables, dynamic_ncols=True, desc="Clustering"):
-            for cluster in table.values():
-                if len(cluster) <= 1:
-                    continue
-                uid = min(cluster)
-                for x in cluster:
-                    union_find.union(x, uid)
+                    first = hashtable.setdefault(h, uid)
+                    if first != uid:
+                        union_find.union(uid, first)
         logger.info(
             f"There are {len(set(union_find.parent.values()))} "
             f"clusters that includes multiple near-duplicate samples."
