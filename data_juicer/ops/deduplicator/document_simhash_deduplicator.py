@@ -147,10 +147,14 @@ class DocumentSimhashDeduplicator(Deduplicator):
         if len(dataset) <= 1:
             return dataset, {}
 
+        # read the hash column once: iterating dataset[column] decodes it
+        # row by row
+        simhashes = dataset[HashKeys.simhash][:]
+
         # find matches
         logger.info(f"Start querying {len(dataset)} samples.")
         matches = simhash.find_all(
-            np.uint64(dataset[HashKeys.simhash]),
+            np.uint64(simhashes),
             self.num_blocks,
             self.hamming_distance,
         )
@@ -163,14 +167,10 @@ class DocumentSimhashDeduplicator(Deduplicator):
             y = str(y)
             graph[x][y] = graph[y][x] = True
 
-        hash2ids: Dict[str, Set[str]] = defaultdict(set)
-        hashes: Set[str] = set(dataset[HashKeys.simhash])
+        hashes: Set[str] = set(simhashes)
         hash2cluster: Dict[str, int] = {}
         visited: Set[str] = set()
         cluster_id: int = 0
-
-        for sid, hash_val in enumerate(dataset[HashKeys.simhash]):
-            hash2ids[hash_val].add(str(sid))
 
         # clustering
         dup_pairs = {}  # store duplicate pairs when show_num > 0
@@ -206,33 +206,27 @@ class DocumentSimhashDeduplicator(Deduplicator):
         # filter duplicated samples
         # NOTICE: For now, we only keep the first sample in a cluster. Maybe
         # there are some better strategies later.
-        def _filter_simhash_dup_helper(sample, visited_clusters, visited_hashes):
-            sample_hash_val = sample[HashKeys.simhash]
+        # The kept indices are computed from the hash column alone, so the
+        # other columns are never decoded.
+        visited_clusters = set()
+        visited_hashes = set()
+        keep = []
+        for idx, sample_hash_val in enumerate(simhashes):
             if sample_hash_val not in hash2cluster:
                 # single-sample cluster, we need to check hash value still.
-                if sample_hash_val in visited_hashes:
-                    return False
-                else:
+                if sample_hash_val not in visited_hashes:
                     visited_hashes.add(sample_hash_val)
-                    return True
+                    keep.append(idx)
             else:
                 cluster_num = hash2cluster[sample_hash_val]
                 if show_num > 0 and cluster_num in dup_pairs and len(dup_pairs[cluster_num]) < 2:
-                    dup_pairs[cluster_num].append(sample)
+                    dup_pairs[cluster_num].append(dataset[idx])
                 # regular cluster, check cluster number.
-                if cluster_num in visited_clusters:
-                    return False
-                else:
+                if cluster_num not in visited_clusters:
                     visited_clusters.add(cluster_num)
-                    return True
+                    keep.append(idx)
 
-        cluster_record = set()
-        hash_record = set()
-        dataset = dataset.filter(
-            _filter_simhash_dup_helper,
-            fn_kwargs=dict(visited_clusters=cluster_record, visited_hashes=hash_record),
-            load_from_cache_file=False if show_num > 0 else True,
-        )
+        dataset = dataset.select(keep)
         logger.info(f"Keep {len(dataset)} samples after SimHash dedup.")
 
         return dataset, dup_pairs
