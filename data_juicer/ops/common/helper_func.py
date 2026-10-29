@@ -12,11 +12,20 @@ class UnionFind:
         self.parent: Dict[int, int] = {}
 
     def find(self, x):
-        if x not in self.parent:
-            self.parent[x] = x
-        if self.parent[x] != x:
-            self.parent[x] = self.find(self.parent[x])
-        return self.parent[x]
+        # iterative, as parent chains can be longer than the recursion limit
+        parent = self.parent
+        if x not in parent:
+            parent[x] = x
+            return x
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        # path compression
+        while x != root:
+            next_x = parent[x]
+            parent[x] = root
+            x = next_x
+        return root
 
     def union(self, x, y):
         px = self.find(x)

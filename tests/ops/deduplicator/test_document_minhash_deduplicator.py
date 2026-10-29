@@ -1052,6 +1052,20 @@ class DocumentMinhashDeduplicatorRepeatedCallTest(DataJuicerTestCaseBase):
         self.assertEqual(len(result_b), 2,
                          "UID-based dedup must not carry state between process() calls")
 
+    def test_with_uid_descending_uids_keep_smallest(self):
+        # each sample has a smaller uid than the cluster root so far, which
+        # builds a parent chain as long as the dataset
+        num_samples = 1500
+        ds_list = [{
+            'text': 'the same document text repeated in every sample',
+            HashKeys.uid: num_samples - 1 - i,
+        } for i in range(num_samples)]
+        dataset = Dataset.from_list(ds_list)
+        op = DocumentMinhashDeduplicatorWithUid()
+        dataset = dataset.map(op.compute_hash)
+        result, _ = op.process(dataset)
+        self.assertEqual(result[HashKeys.uid][:], [0])
+
 
 class DocumentMinhashDeduplicatorEmptyInputTest(DataJuicerTestCaseBase):
     """Tests for samples whose text produces zero tokens.
