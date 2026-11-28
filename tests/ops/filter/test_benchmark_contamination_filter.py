@@ -4,7 +4,12 @@ import os
 import shutil
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
+
+import numpy as np
 
 from data_juicer.core.data import NestedDataset as Dataset
 from data_juicer.ops.filter.benchmark_contamination_filter import (
@@ -158,6 +163,77 @@ class BenchmarkContaminationFilterTest(DataJuicerTestCaseBase):
         ds_list = [{"text": BENCH_EN}, {"text": UNRELATED_EN}]
         self.assertEqual(self._run_filter(ds_list, op), ds_list)
 
+    def test_gzip_cache_hit_preserves_run_output(self):
+        path = Path(self.tmp_dir) / "compressed.jsonl.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as fout:
+            fout.write(json.dumps({"text": BENCH_EN}) + "\n")
+        cache = Path(self.tmp_dir) / "cache"
+        options = dict(benchmark_path=str(path), auto_op_parallelism=False, num_proc=None)
+        uncached = BenchmarkContaminationFilter(**options)
+        BenchmarkContaminationFilter(**options, index_cache_dir=str(cache))
+        with patch.object(BenchmarkContaminationFilter, "_index_texts", side_effect=AssertionError("cache miss")):
+            reused = BenchmarkContaminationFilter(**options, index_cache_dir=str(cache))
+
+        rows = [{"text": BENCH_EN}, {"text": UNRELATED_EN}]
+        expected = uncached.run(Dataset.from_list(rows)).to_list()
+        self.assertEqual(reused.run(Dataset.from_list(rows)).to_list(), expected)
+        self.assertEqual([row["text"] for row in expected], [UNRELATED_EN])
+
+    def test_cache_key_tracks_content_and_indexing_settings(self):
+        path = Path(self.tmp_dir) / "benchmark.txt"
+        cache = Path(self.tmp_dir) / "cache"
+        options = dict(benchmark_path=str(path), index_cache_dir=str(cache), ngram_size=3)
+        path.write_text("Alpha Romeo", encoding="utf-8")
+        original = path.stat()
+        first = BenchmarkContaminationFilter(**options)
+        path.write_text("Bravo Oscar", encoding="utf-8")
+        os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+        second = BenchmarkContaminationFilter(**options)
+        case_sensitive = BenchmarkContaminationFilter(**options, lowercase=False)
+
+        self.assertEqual(first._count_hits(first._ngram_hashes("alpha romeo")), 9)
+        self.assertEqual(second._count_hits(second._ngram_hashes("alpha romeo")), 0)
+        self.assertEqual(case_sensitive._count_hits(case_sensitive._ngram_hashes("Bravo Oscar")), 9)
+        self.assertEqual(case_sensitive._count_hits(case_sensitive._ngram_hashes("bravo oscar")), 5)
+        self.assertEqual(len(list(cache.glob("*.bin"))), 3)
+
+    def test_corrupt_cache_is_rebuilt_and_unusable_cache_falls_back(self):
+        cache = Path(self.tmp_dir) / "cache"
+        options = dict(benchmark_path=self.bench_path, index_cache_dir=str(cache))
+        expected = BenchmarkContaminationFilter(**options)._index
+        entry = next(cache.iterdir())
+        original = entry.read_bytes()
+        entry.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+        rebuilt = BenchmarkContaminationFilter(**options)
+        self.assertEqual(entry.read_bytes(), original)
+        np.testing.assert_array_equal(rebuilt._index, expected)
+
+        unusable = Path(self.tmp_dir) / "not_a_directory"
+        unusable.touch()
+        with self.assertLogs(level="WARNING"):
+            fallback = BenchmarkContaminationFilter(benchmark_path=self.bench_path, index_cache_dir=str(unusable))
+        np.testing.assert_array_equal(fallback._index, expected)
+
+    def test_simultaneous_cold_builds_publish_complete_entries(self):
+        cache = Path(self.tmp_dir) / "cache"
+        options = dict(benchmark_path=self.bench_path, index_cache_dir=str(cache))
+        build = BenchmarkContaminationFilter._index_texts
+        barrier = Barrier(3, timeout=10)
+
+        def synchronized_build(operator, *args):
+            barrier.wait()
+            return build(operator, *args)
+
+        with patch.object(BenchmarkContaminationFilter, "_index_texts", synchronized_build):
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = [pool.submit(BenchmarkContaminationFilter, **options) for _ in range(3)]
+                indexes = [future.result()._index for future in futures]
+
+        self.assertEqual(len(list(cache.iterdir())), 1)
+        warm = BenchmarkContaminationFilter(**options)._index
+        for index in indexes:
+            np.testing.assert_array_equal(warm, index)
+
     def test_unsupported_format_raises(self):
         bad_path = os.path.join(self.tmp_dir, "bench.csv")
         with open(bad_path, "w", encoding="utf-8") as fout:
@@ -268,6 +344,23 @@ class BenchmarkContaminationFilterTest(DataJuicerTestCaseBase):
         self.assertEqual(list(scores), sorted(suites))
         self.assertEqual({name for name, score in scores.items() if score["ratio"] == 1.0}, matching)
         self.assertTrue(all(score["ngram_count"] == 0 for name, score in scores.items() if name not in matching))
+
+    def test_multisuite_index_cache_round_trip_preserves_scores(self):
+        other_path = Path(self.tmp_dir) / "science.txt"
+        other_path.write_text(LONG_TAIL, encoding="utf-8")
+        cache_dir = Path(self.tmp_dir) / "indexes"
+        options = dict(
+            benchmark_suites={"math": self.bench_path, "science": str(other_path)},
+            index_cache_dir=str(cache_dir),
+            auto_op_parallelism=False,
+            num_proc=None,
+        )
+        rows = [{"text": text} for text in (BENCH_EN, LONG_TAIL, UNRELATED_EN)]
+        cold = BenchmarkContaminationFilter(**options).run(Dataset.from_list(rows), reduce=False)
+        self.assertEqual(len(list(cache_dir.glob("*.bin"))), 2)
+        with patch.object(BenchmarkContaminationFilter, "_index_texts", side_effect=AssertionError("cache miss")):
+            warm = BenchmarkContaminationFilter(**options).run(Dataset.from_list(rows), reduce=False)
+        self.assertEqual(warm.to_list(), cold.to_list())
 
     def test_invalid_suite_settings_fail_early(self):
         for sources in ({}, {"": self.bench_path}, {"broken": ""}):
