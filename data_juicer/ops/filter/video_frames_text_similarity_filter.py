@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from PIL import ImageOps
 from pydantic import PositiveInt
 
@@ -51,6 +52,7 @@ class VideoFramesTextSimilarityFilter(Filter):
         any_or_all: str = "any",
         reduce_mode: str = "avg",
         *args,
+        max_batch_frames: PositiveInt = 32,
         **kwargs,
     ):
         """
@@ -87,6 +89,8 @@ class VideoFramesTextSimilarityFilter(Filter):
             'avg': Take the average of multiple values
             'max': Take the max of multiple values
             'min': Take the min of multiple values
+        :param max_batch_frames: maximum number of frames per CLIP forward when
+            batch_mode is enabled.
         :param args: extra args
         :param kwargs: extra args
         """
@@ -115,98 +119,129 @@ class VideoFramesTextSimilarityFilter(Filter):
         self.vertical_flip = vertical_flip
         self.frame_sampling_method = frame_sampling_method
         self.frame_num = frame_num
+        if max_batch_frames < 1:
+            raise ValueError("max_batch_frames must be positive")
+        self.max_batch_frames = max_batch_frames
 
         self.sampled_frames_key_suffix = f"-{frame_sampling_method}" + (
             "" if frame_sampling_method == "all_keyframes" else f"-{frame_num}"
         )
 
-    def compute_stats_single(self, sample, rank=None, context=False):
-        # check if it's computed already
-        if StatsKeys.video_frames_text_similarity in sample[Fields.stats]:
-            return sample
-
-        # there is no videos in this sample
-        if self.video_key not in sample or not sample[self.video_key]:
-            sample[Fields.stats][StatsKeys.video_frames_text_similarity] = np.array([], dtype=np.float64)
-            return sample
-
-        # load videos
+    def _video_text_chunks(self, sample, context):
         loaded_video_keys = sample[self.video_key]
         sample, videos = load_data_with_context(sample, context, loaded_video_keys, load_video)
-
-        text = sample[self.text_key]
         offset = 0
-        similarity = []
-        model, processor = get_model(self.model_key, rank, self.use_cuda())
-
-        for chunk in text.split(SpecialTokens.eoc):
-            count = chunk.count(SpecialTokens.video)
-
-            # no video or no text
-            if count == 0 or len(chunk) == 0:
-                continue
-            else:
-                text_chunk = remove_special_tokens(chunk)
-                video_frame_images_chunk = []
+        try:
+            for chunk in sample[self.text_key].split(SpecialTokens.eoc):
+                count = chunk.count(SpecialTokens.video)
+                if not count:
+                    continue
+                images = []
                 for video_key in loaded_video_keys[offset : offset + count]:
                     video = videos[video_key]
                     sampled_frames_key = video_key + self.sampled_frames_key_suffix
-
-                    # extract frame images
                     if context and sampled_frames_key in sample[Fields.context]:
-                        # context hit
                         frames = sample[Fields.context][sampled_frames_key]
                     else:
                         if self.frame_sampling_method == "all_keyframes":
                             frames = extract_key_frames(video)
-                        elif self.frame_sampling_method == "uniform":
-                            frames = extract_video_frames_uniformly(video, self.frame_num)
                         else:
-                            frames = []
-
-                        # store the sampled frames in the context
+                            frames = extract_video_frames_uniformly(video, self.frame_num)
                         if context:
                             sample[Fields.context][sampled_frames_key] = frames
 
-                    frame_images = [frame.to_image() for frame in frames]
-                    for image in frame_images:
+                    for frame in frames:
+                        image = frame.to_image()
                         if self.horizontal_flip:
                             image = ImageOps.mirror(image)
                         if self.vertical_flip:
                             image = ImageOps.flip(image)
-                        video_frame_images_chunk.append(image)
+                        images.append(image)
+                offset += count
+                yield remove_special_tokens(chunk), images
+        finally:
+            if not context:
+                for video in videos.values():
+                    close_video(video)
 
-                if len(video_frame_images_chunk) > 0:
-                    inputs = processor(
-                        text=text_chunk,
-                        images=video_frame_images_chunk,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=model.config.text_config.max_position_embeddings,
-                        padding=True,
-                    ).to(model.device)
+    def _clip_logits(self, texts, images, rank):
+        model, processor = get_model(self.model_key, rank, self.use_cuda())
+        inputs = processor(
+            text=texts,
+            images=images,
+            return_tensors="pt",
+            truncation=True,
+            max_length=model.config.text_config.max_position_embeddings,
+            padding=True,
+        ).to(model.device)
+        return model(**inputs).logits_per_text
 
-                    outputs = model(**inputs)
-                    chunk_logits = outputs.logits_per_text / 100.0
+    def _reduce_scores(self, scores):
+        if self.reduce_mode == "avg":
+            return float(scores.mean())
+        if self.reduce_mode == "max":
+            return float(scores.max())
+        return float(scores.min())
 
-                    if self.reduce_mode == "avg":
-                        chunk_similarity = chunk_logits.mean()
-                    elif self.reduce_mode == "max":
-                        chunk_similarity = chunk_logits.max()
-                    else:
-                        chunk_similarity = chunk_logits.min()
-                else:
-                    chunk_similarity = 0.0
+    def compute_stats_single(self, sample, rank=None, context=False):
+        key = StatsKeys.video_frames_text_similarity
+        stats = sample[Fields.stats]
+        if stats.get(key) is not None:
+            return sample
+        if not sample.get(self.video_key):
+            stats[key] = np.array([], dtype=np.float64)
+            return sample
 
-                similarity.append(float(chunk_similarity))
-            offset += count
-        sample[Fields.stats][StatsKeys.video_frames_text_similarity] = similarity
-
-        if not context:
-            for vid_key in videos:
-                close_video(videos[vid_key])
-
+        stats[key] = [
+            self._reduce_scores(self._clip_logits(text, images, rank) / 100.0) if images else 0.0
+            for text, images in self._video_text_chunks(sample, context)
+        ]
         return sample
+
+    @torch.inference_mode()
+    def _score_frame_batch(self, frame_batch, rank):
+        images = [image for _, frames, _ in frame_batch for image in frames]
+        logits = self._clip_logits([text for text, _, _ in frame_batch], images, rank)
+        sizes = [len(frames) for _, frames, _ in frame_batch]
+        # Keep only the frame range owned by each text from the pairwise logits.
+        matched = [block[i] for i, block in enumerate(logits.split(sizes, dim=1))]
+        scores = (torch.cat(matched) / 100.0).cpu()
+        for (_, _, chunk_scores), part in zip(frame_batch, scores.split(sizes), strict=True):
+            chunk_scores.append(part)
+
+    def compute_stats_batched(self, samples, rank=None, context=False):
+        if not self.batch_mode:
+            return super().compute_stats_batched(samples, rank=rank, context=context)
+
+        key = StatsKeys.video_frames_text_similarity
+        pending = []
+        pending_frames = 0
+        rows_to_reduce = []
+        for i, stats in enumerate(samples[Fields.stats]):
+            if stats.get(key) is not None:
+                continue
+            sample = {column: values[i] for column, values in samples.items()}
+            if not sample.get(self.video_key):
+                stats[key] = np.array([], dtype=np.float64)
+                continue
+            row_chunks = []
+            rows_to_reduce.append((stats, row_chunks))
+            for text, images in self._video_text_chunks(sample, context):
+                chunk_scores = []
+                row_chunks.append(chunk_scores)
+                for start in range(0, len(images), self.max_batch_frames):
+                    frames = images[start : start + self.max_batch_frames]
+                    if pending_frames + len(frames) > self.max_batch_frames:
+                        self._score_frame_batch(pending, rank)
+                        pending.clear()
+                        pending_frames = 0
+                    pending.append((text, frames, chunk_scores))
+                    pending_frames += len(frames)
+        if pending:
+            self._score_frame_batch(pending, rank)
+        for stats, row_chunks in rows_to_reduce:
+            stats[key] = [self._reduce_scores(torch.cat(parts)) if parts else 0.0 for parts in row_chunks]
+        return samples
 
     def process_single(self, sample, rank=None):
         similarity = sample[Fields.stats][StatsKeys.video_frames_text_similarity]

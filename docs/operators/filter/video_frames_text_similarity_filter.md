@@ -25,8 +25,23 @@ Tags 标签: gpu, hf, multimodal
 | `vertical_flip` | <class 'bool'> | `False` | flip frame image vertically (top to bottom). |
 | `any_or_all` | <class 'str'> | `'any'` | keep this sample with 'any' or 'all' strategy of all videos. 'any': keep this sample if any videos meet the condition. 'all': keep this sample only if all videos meet the condition. |
 | `reduce_mode` | <class 'str'> | `'avg'` | reduce mode when one text corresponds to multiple video frame images in a chunk. 'avg': Take the average of multiple values 'max': Take the max of multiple values 'min': Take the min of multiple values |
+| `max_batch_frames` | positive integer | `32` | maximum number of frames sent to CLIP in one forward pass with `batch_mode: true`. |
 | `args` |  | `''` | extra args |
 | `kwargs` |  | `''` | extra args |
+
+Enable batched inference with the sample-level `batch_mode` and `batch_size` options. A chunk with more than `max_batch_frames` frames is scored in several forwards and reduced once. Floating-point scores can differ slightly from single-sample inference, especially near a filter boundary.
+
+使用 `batch_mode` 和 `batch_size` 启用批量打分。`max_batch_frames` 限制单次模型前向的总帧数。超出上限的文本片段会分次打分，最后统一聚合。
+
+```yaml
+process:
+  - video_frames_text_similarity_filter:
+      batch_mode: true
+      batch_size: 16
+      max_batch_frames: 32
+      frame_sampling_method: uniform
+      frame_num: 3
+```
 
 ## 📊 Effect demonstration 效果演示
 ### test_default_filter

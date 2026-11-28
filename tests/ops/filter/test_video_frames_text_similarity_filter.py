@@ -1,5 +1,8 @@
 import os
 import unittest
+from unittest.mock import patch
+
+import torch
 
 from data_juicer.core.data import NestedDataset as Dataset
 
@@ -268,6 +271,60 @@ class VideoFramesTextSimilarityFilterTest(DataJuicerTestCaseBase):
                                                       tgt_list,
                                                       op,
                                                       np=2)
+
+
+class VideoFramesTextSimilarityBatchTest(unittest.TestCase):
+
+    @patch('data_juicer.ops.filter.video_frames_text_similarity_filter.prepare_model')
+    def test_batch_pairs_frames_with_their_own_text_and_limits_forward_size(self, _):
+        key = 'video_frames_text_similarity'
+        chunks = {
+            'a': [('1', [1, 2]), ('2', [])],
+            'b': [('3', [1, 2, 3, 4, 5])],
+            'c': [('4', [5])],
+        }
+        for reduce_mode in ('avg', 'min', 'max'):
+            with self.subTest(reduce=reduce_mode):
+                op = VideoFramesTextSimilarityFilter(
+                    batch_mode=True, max_batch_frames=3, reduce_mode=reduce_mode,
+                    min_score=0.15, max_score=0.36,
+                )
+                cases = [
+                    {'videos': ['a'], Fields.stats: {}},
+                    {'videos': ['b'], Fields.stats: {}},
+                    {'videos': [], Fields.stats: {}},
+                    {'videos': ['c'], Fields.stats: {key: [0.9]}},
+                    {'videos': ['c'], Fields.stats: {}},
+                ]
+                calls = []
+
+                def logits(texts, frames, rank):
+                    if isinstance(texts, str):
+                        texts = [texts]
+                    calls.append((tuple(texts), len(frames)))
+                    return torch.tensor([[10 * int(text) + frame for frame in frames] for text in texts])
+
+                with (
+                    patch.object(op, '_clip_logits', side_effect=logits),
+                    patch.object(
+                        op, '_video_text_chunks',
+                        side_effect=lambda sample, context: iter(chunks[sample['videos'][0]]),
+                    ),
+                ):
+                    baseline = [
+                        op.compute_stats_single({**row, Fields.stats: dict(row[Fields.stats])})
+                        for row in cases
+                    ]
+                    calls.clear()
+                    dataset = Dataset.from_list(cases)
+                    scored = dataset.map(op.compute_stats, batch_size=len(cases))
+                    self.assertEqual(calls, [(('1',), 2), (('3',), 3), (('3', '4'), 3)])
+                    self.assertEqual(
+                        [list(stat[key]) for stat in scored[Fields.stats]],
+                        [list(row[Fields.stats][key]) for row in baseline],
+                    )
+                    kept = scored.filter(op.process, batch_size=len(cases))
+                    self.assertEqual(list(kept['videos']), [['b'], []])
 
 
 if __name__ == '__main__':
